@@ -5,8 +5,8 @@ El objetivo es tener un espacio donde mostrar lo que hago, mis habilidades y mi 
 
 ## 🚀 Tecnologías utilizadas
 
-- **HTML5**, **CSS3**, **JavaScript**  
-- *(Opcional: **React**, **Next.js**, **Vite**, etc. si lo usas)*  
+- **HTML**, **CSS**, **JavaScript**  
+- **Angular**  
 - **Git** y **GitHub Pages** para el despliegue
 
 
