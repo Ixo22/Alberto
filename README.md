@@ -19,6 +19,6 @@ El objetivo es tener un espacio donde mostrar lo que hago, mis habilidades y mi 
 
 ## 📬 Contacto
 
-Puedes contactarme en [aga.alberto.st@gmail.com] o a través de mis redes
+Puedes contactarme en aga.alberto.st@gmail.com o a través de mis redes
 - https://www.linkedin.com/in/aalbeerto/
 
