@@ -4,6 +4,9 @@ import random
 import re
 import os
 import threading
+import psycopg2
+from psycopg2 import pool
+from dotenv import load_dotenv
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup 
 from telegram.ext import (
@@ -34,13 +37,32 @@ def run_web_server():
     app.run(host='0.0.0.0', port=port)
 # --------------------------------------
 
+
 # --- ¡CONFIGURACIÓN OBLIGATORIA! ---
 MI_TOKEN = os.environ.get("MI_TOKEN")
-MI_CHAT_ID = os.environ.get("MI_CHAT_ID") # (Aunque ya no lo uses, por si acaso)
+MI_CHAT_ID = os.environ.get("MI_CHAT_ID")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if not MI_TOKEN:
     print("!!! ERROR CRÍTICO: No se encontró la variable de entorno MI_TOKEN !!!")
     exit()
+    
+if not DATABASE_URL:
+    print("!!! ERROR CRÍTICO: No se encontró la variable de entorno DATABASE_URL !!!")
+    exit()
+
+
+# --- ¡NUEVO! Conexión a la Base de Datos ---
+# Creamos un "pool" de conexiones. Es como una caja de herramientas de BD.
+print("Creando pool de conexiones a la base de datos...")
+try:
+    db_pool = psycopg2.pool.SimpleConnectionPool(1, 5, dsn=DATABASE_URL)
+    print("Pool de conexiones creado con éxito.")
+except (Exception, psycopg2.Error) as error:
+    print("!!! ERROR CRÍTICO: No se pudo conectar a la base de datos !!!", error)
+    exit()
+# ----------------------------------------
+
 
 from config import (
     TICKERS_A_VIGILAR,
@@ -83,6 +105,41 @@ def obtener_precio_actual(ticker_simbolo):
         return None, None 
 
 # --- 2. Lógica de Comandos del Bot ---
+async def init_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    ¡Comando de un solo uso! Crea la tabla de alertas en la BD.
+    """
+    conn = None
+    try:
+        # Pide una conexión del pool
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        
+        # Esta es la "sentencia" SQL para crear la tabla
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS alerts (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            ticker_symbol VARCHAR(20) NOT NULL,
+            alias_general VARCHAR(50) NOT NULL,
+            target_price NUMERIC(12, 2) NOT NULL,
+            is_triggered BOOLEAN DEFAULT FALSE
+        );
+        """
+        cursor.execute(create_table_query)
+        conn.commit()
+        
+        print("¡Tabla 'alerts' verificada/creada con éxito!")
+        await update.message.reply_text("¡Base de datos inicializada! La tabla 'alerts' está lista.")
+        
+    except (Exception, psycopg2.Error) as error:
+        print("Error al inicializar la BD:", error)
+        await update.message.reply_text(f"Error al inicializar la BD: {error}")
+    finally:
+        # Devuelve la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Responde cuando el usuario envía /start"""
@@ -336,73 +393,7 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     # Si no es nada, se queda callado. Perfecto.
     
-    
- 
- 
- 
- 
-async def nueva_alerta(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Crea una nueva alerta.
-    Uso: /alerta <trigger> <precio>
-    Ej: /alerta sp500 650
-    """
-    chat_id = update.message.chat_id
-    
-    # context.args es la lista de palabras después del comando
-    if len(context.args) != 2:
-        await update.message.reply_text("Formato incorrecto. Uso:\n/alerta <trigger> <precio>\n\nEjemplo: /alerta sp500 650")
-        return
 
-    # 1. Procesamos el <trigger> (ej: "sp500")
-    trigger_usuario = context.args[0].lower()
-    ticker_info_encontrada = None
-    
-    for ticker_data in TICKERS_A_VIGILAR:
-        # Buscamos en el regex de cada ticker si el trigger coincide
-        if re.search(ticker_data["patron_regex"], trigger_usuario):
-            ticker_info_encontrada = ticker_data
-            break
-            
-    if not ticker_info_encontrada:
-        await update.message.reply_text(f"No reconozco el activo '{trigger_usuario}'.\nUsa /tickers para ver la lista.")
-        return
-        
-    # 2. Procesamos el <precio> (ej: "650")
-    try:
-        target_price = float(context.args[1])
-    except ValueError:
-        await update.message.reply_text(f"El precio '{context.args[1]}' no es un número válido.")
-        return
-        
-    # 3. Creamos y guardamos la alerta
-    if "user_alerts" not in context.bot_data:
-        context.bot_data["user_alerts"] = []
-
-    # (Nota: Coge el primer ticker de la lista, ej: SXR8.DE para SP500)
-    ticker_simbolo = ticker_info_encontrada["tickers"][0]["symbol"]
-    
-    nueva_alerta_data = {
-        "ticker": ticker_simbolo,
-        "alias": ticker_info_encontrada["alias_general"],
-        "target": target_price,
-        "chat_id": chat_id, # ¡Alerta personalizada para quien la pide!
-        "triggered": False
-    }
-    
-    context.bot_data["user_alerts"].append(nueva_alerta_data)
-    
-    # 4. Confirmamos
-    mensaje = (
-        f"¡Alerta Creada! ✅\n\n"
-        f"Vigilaré *{nueva_alerta_data['alias']}* y te avisaré si baja de *{target_price:,.2f}*"
-    )
-    await update.message.reply_text(mensaje, parse_mode="Markdown")
-    
-    
-    
-    
-# (Pega esto donde estaba la antigua 'nueva_alerta')
 
 async def conv_start_alerta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
@@ -467,47 +458,54 @@ async def conv_ticker_elegido(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def conv_precio_recibido(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Paso 3: El usuario ha escrito un precio.
-    Guarda la alerta y termina la conversación.
+    ¡VERSIÓN SQL! Guarda la alerta en la BD.
     """
-    # 1. Recuperamos el ticker de la "memoria a corto plazo"
     try:
         ticker_info = context.user_data["alerta_ticker_info"]
     except KeyError:
         await update.message.reply_text("¡Ups! Me he perdido. Empecemos de nuevo con /alerta.")
         return ConversationHandler.END
 
-    # 2. Validamos el precio
     try:
         target_price = float(update.message.text)
     except ValueError:
         await update.message.reply_text(f"'{update.message.text}' no es un número válido.\n\nEscribe solo el número (ej: 650) o /cancelar.")
         return STATE_SET_PRICE # Nos quedamos en este paso
 
-    # 3. ¡TENEMOS TODO! Creamos y guardamos la alerta (en la "memoria a largo plazo")
-    if "user_alerts" not in context.bot_data:
-        context.bot_data["user_alerts"] = []
+    # --- ¡LÓGICA DE BD! ---
+    conn = None
+    try:
+        ticker_simbolo = ticker_info["tickers"][0]["symbol"]
+        alias_general = ticker_info["alias_general"]
+        chat_id = update.message.chat_id
 
-    nueva_alerta_data = {
-        "ticker": ticker_info["tickers"][0]["symbol"],
-        "alias": ticker_info["alias_general"],
-        "target": target_price,
-        "chat_id": update.message.chat_id,
-        "triggered": False
-    }
-    context.bot_data["user_alerts"].append(nueva_alerta_data)
-    
-    # 4. Limpiamos la memoria a corto plazo
-    context.user_data.clear()
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        
+        insert_query = """
+        INSERT INTO alerts (chat_id, ticker_symbol, alias_general, target_price)
+        VALUES (%s, %s, %s, %s)
+        """
+        cursor.execute(insert_query, (chat_id, ticker_simbolo, alias_general, target_price))
+        conn.commit()
 
-    # 5. Confirmamos y terminamos
-    mensaje = (
-        f"¡Alerta Creada! ✅\n\n"
-        f"Vigilaré *{nueva_alerta_data['alias']}* y te avisaré si baja de *{target_price:,.2f}*\n\n"
-        "Puedes verla con /misalertas."
-    )
-    await update.message.reply_text(mensaje, parse_mode="Markdown")
-    
-    return ConversationHandler.END
+        context.user_data.clear()
+
+        mensaje = (
+            f"¡Alerta Creada! ✅\n\n"
+            f"Vigilaré *{alias_general}* y te avisaré si baja de *{target_price:,.2f}*DA\n\n"
+            "Puedes verla con /misalertas."
+        )
+        await update.message.reply_text(mensaje, parse_mode="Markdown")
+        return ConversationHandler.END
+        
+    except (Exception, psycopg2.Error) as error:
+        print(f"Error creando alerta en BD: {error}")
+        await update.message.reply_text(f"Error al guardar la alerta: {error}")
+        return ConversationHandler.END
+    finally:
+        if conn:
+            db_pool.putconn(conn)
 
 
 async def conv_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -517,144 +515,206 @@ async def conv_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 
-async def mis_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra las alertas activas del usuario (con tickers) y botones para borrar."""
-    
-    chat_id = update.message.chat_id
-    user_alerts = context.bot_data.get("user_alerts", [])
-    
-    # Filtramos la lista para mostrar solo las de ESTE usuario
-    alertas_de_este_usuario = []
-    for i, alert in enumerate(user_alerts):
-        if alert.get("chat_id") == chat_id:
-            alertas_de_este_usuario.append((i, alert)) # Guardamos (índice_global, alerta)
-    
-    if not alertas_de_este_usuario:
-        await update.message.reply_text("No tienes ninguna alerta activa.\nCrea una con /alerta <trigger> <precio>")
-        return
 
-    keyboard = []
-    partes_del_mensaje = ["Tus Alertas Activas:\n"]
-    
-    for i_global, alert in alertas_de_este_usuario:
-        alias = alert['alias']
-        target = alert['target']
-        ticker = alert['ticker'] # <-- ¡AQUÍ ESTÁ!
-        
-        # --- ¡MODIFICADO! ---
-        # Añadimos el '(ticker)'
-        partes_del_mensaje.append(f"\n-> {alias} ({ticker}) < {target:,.2f}")
-        
-        # Creamos un botón de borrado para CADA alerta
-        boton = InlineKeyboardButton(
-            text=f"Borrar {alias} ({ticker})", # <-- (Lo añado aquí también) 
-            callback_data=f"delete_alert:{i_global}"
-        )
-        keyboard.append([boton])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Enviamos en texto plano (sin parse_mode) para evitar errores
-    await update.message.reply_text("".join(partes_del_mensaje), reply_markup=reply_markup)
-
-
-async def borrar_alerta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Se ejecuta cuando el usuario pulsa un botón de "Borrar".
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    try:
-        prefix, index_str = query.data.split(":")
-        index = int(index_str)
-        
-        # Borramos la alerta de la lista global usando su índice
-        alert_borrada = context.bot_data["user_alerts"].pop(index)
-        alias = alert_borrada["alias"]
-        
-        # Editamos el mensaje original para confirmar
-        await query.edit_message_text(f"Alerta para *{alias}* borrada con éxito.", parse_mode="Markdown")
-        
-    except (ValueError, IndexError, KeyError):
-        await query.edit_message_text("Error al borrar la alerta. Ya no existe o está corrupta.")
- 
 
 async def check_all_alerts(context: ContextTypes.DEFAULT_TYPE):
     """
-    Esta es la función que ejecuta el JobQueue.
-    ¡RECORRE TODAS LAS ALERTAS DE TODOS LOS USUARIOS!
+    ¡VERSIÓN SQL! Recorre la tabla 'alerts' de la BD.
     """
-    
-    # 1. Obtiene la lista de alertas. Si no existe, la crea vacía.
-    if "user_alerts" not in context.bot_data:
-        context.bot_data["user_alerts"] = []
-
-    user_alerts = context.bot_data["user_alerts"]
-    
-    if not user_alerts:
-        print("JobQueue: No hay alertas de usuario que comprobar. Durmiendo.")
-        return
-
-    print(f"JobQueue: Comprobando {len(user_alerts)} alerta(s) de usuario...")
-
-    # Creamos una lista de alertas para eliminar (si dan error)
-    alerts_to_remove = []
-
-    # 2. Recorre cada alerta que los usuarios han creado
-    # Usamos enumerate() para poder borrar por índice si algo falla
-    for i, alert in enumerate(user_alerts):
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
         
-        try:
-            ticker_simbolo = alert["ticker"]
-            ticker_alias = alert["alias"]
-            target_price = alert["target"]
-            chat_id_aviso = alert["chat_id"]
-            is_triggered = alert.get("triggered", False)
+        cursor.execute("SELECT id, chat_id, ticker_symbol, alias_general, target_price, is_triggered FROM alerts")
+        all_alerts = cursor.fetchall()
 
-            # 3. Obtenemos el precio real
-            precio, moneda = obtener_precio_actual(ticker_simbolo)
+        if not all_alerts:
+            print("JobQueue: No hay alertas en la BD. Durmiendo.")
+            return
+
+        print(f"JobQueue: Comprobando {len(all_alerts)} alerta(s) de la BD...")
+
+        for alert in all_alerts:
+            alert_id, chat_id_aviso, ticker_simbolo, ticker_alias, target_price, is_triggered = alert
             
-            if precio is None:
-                print(f"JobQueue: No se pudo obtener el precio para {ticker_alias}. Saltando.")
-                continue # Pasa a la siguiente alerta del bucle
+            # target_price es un objeto Decimal, lo pasamos a float
+            target_price = float(target_price)
 
-            # 4. Lógica de la Alerta (¡Tu código, pero con variables!)
+            precio, moneda = obtener_precio_actual(ticker_simbolo)
+            if precio is None:
+                continue
+
             if precio < target_price and not is_triggered:
                 print(f"JobQueue: ¡ALERTA DISPARADA! {ticker_alias} < {target_price}")
-                
                 mensaje = (
                     f"🔔 *¡ALERTA DE PRECIO!* 🔔\n\n"
                     f"El activo *{ticker_alias}* ha caído por debajo de tu objetivo.\n\n"
                     f"Precio Actual -> {precio:,.2f} {moneda}\n"
                     f"Tu Objetivo     -> {target_price:,.2f} {moneda}"
                 )
-                
                 await context.bot.send_message(chat_id=chat_id_aviso, text=mensaje, parse_mode="Markdown")
-                alert["triggered"] = True # Actualiza el estado en la lista
+                
+                # ¡Actualizamos la BD!
+                cursor.execute("UPDATE alerts SET is_triggered = TRUE WHERE id = %s", (alert_id,))
+                conn.commit()
 
             elif precio > target_price and is_triggered:
                 print(f"JobQueue: ALERTA RE-ARMADA. {ticker_alias} > {target_price}")
-                
                 mensaje = (
                     f"✅ *Alerta Reactivada* ✅\n\n"
                     f"El activo *{ticker_alias}* se ha recuperado por encima de {target_price:,.2f} {moneda}.\n"
                     f"La alerta de precio ha sido reactivada."
                 )
-                
                 await context.bot.send_message(chat_id=chat_id_aviso, text=mensaje, parse_mode="Markdown")
-                alert["triggered"] = False # Actualiza el estado
+                
+                # ¡Actualizamos la BD!
+                cursor.execute("UPDATE alerts SET is_triggered = FALSE WHERE id = %s", (alert_id,))
+                conn.commit()
 
-        except Exception as e:
-            print(f"JobQueue: Error procesando alerta {alert}: {e}. Se marcará para borrar.")
-            # Si una alerta está corrupta o falla, la borramos
-            alerts_to_remove.append(i)
+    except (Exception, psycopg2.Error) as error:
+        print(f"JobQueue: Error procesando alertas: {error}")
+    finally:
+        if conn:
+            db_pool.putconn(conn)
 
-    # 5. Limpiamos las alertas que fallaron (si las hubo)
-    # Iteramos a la inversa para no fastidiar los índices
-    for i in sorted(alerts_to_remove, reverse=True):
-        del context.bot_data["user_alerts"][i]
+
+async def nueva_alerta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    ¡VERSIÓN SQL! Inserta una nueva alerta en la BD.
+    (El comando /alerta <trigger> <precio> en modo experto)
+    """
+    chat_id = update.message.chat_id
+    # (El resto de tu lógica de validación de args y tickers es la misma)
+    if len(context.args) != 2:
+        await update.message.reply_text("Formato incorrecto. Uso:\n/alerta <trigger> <precio>\n\nEjemplo: /alerta sp500 650")
+        return
+
+    trigger_usuario = context.args[0].lower()
+    ticker_info_encontrada = None
+    for ticker_data in TICKERS_A_VIGILAR:
+        if re.search(ticker_data["patron_regex"], trigger_usuario):
+            ticker_info_encontrada = ticker_data
+            break
+            
+    if not ticker_info_encontrada:
+        await update.message.reply_text(f"No reconozco el activo '{trigger_usuario}'.\nUsa /tickers para ver la lista.")
+        return
         
+    try:
+        target_price = float(context.args[1])
+    except ValueError:
+        await update.message.reply_text(f"El precio '{context.args[1]}' no es un número válido.")
+        return
+        
+    # --- ¡LÓGICA DE BD! ---
+    conn = None
+    try:
+        ticker_simbolo = ticker_info_encontrada["tickers"][0]["symbol"]
+        alias_general = ticker_info_encontrada["alias_general"]
+
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        
+        insert_query = """
+        INSERT INTO alerts (chat_id, ticker_symbol, alias_general, target_price)
+        VALUES (%s, %s, %s, %s)
+        """
+        cursor.execute(insert_query, (chat_id, ticker_simbolo, alias_general, target_price))
+        conn.commit()
+        
+        mensaje = (
+            f"¡Alerta Creada! ✅\n\n"
+            f"Vigilaré *{alias_general}* y te avisaré si baja de *{target_price:,.2f}*"
+        )
+        await update.message.reply_text(mensaje, parse_mode="Markdown")
+
+    except (Exception, psycopg2.Error) as error:
+        print(f"Error creando alerta en BD: {error}")
+        await update.message.reply_text(f"Error al guardar la alerta: {error}")
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+
+async def mis_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """¡VERSIÓN SQL! Muestra las alertas de la BD."""
+    chat_id = update.message.chat_id
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+
+        select_query = "SELECT id, alias_general, ticker_symbol, target_price FROM alerts WHERE chat_id = %s"
+        cursor.execute(select_query, (chat_id,))
+        
+        alertas_de_este_usuario = cursor.fetchall()
+        
+        if not alertas_de_este_usuario:
+            await update.message.reply_text("No tienes ninguna alerta activa.\nCrea una con /alerta")
+            return
+
+        keyboard = []
+        partes_del_mensaje = ["Tus Alertas Activas:\n"]
+        
+        for alert in alertas_de_este_usuario:
+            alert_id, alias, ticker, target_price = alert
+            target_price = float(target_price) # Convertir de Decimal
+            
+            partes_del_mensaje.append(f"\n-> {alias} ({ticker}) < {target_price:,.2f}")
+            
+            boton = InlineKeyboardButton(
+                text=f"Borrar {alias} ({ticker})", 
+                callback_data=f"delete_alert:{alert_id}" # <-- Usamos el ID de la BD
+            )
+            keyboard.append([boton])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("".join(partes_del_mensaje), reply_markup=reply_markup)
+
+    except (Exception, psycopg2.Error) as error:
+        print(f"Error listando alertas: {error}")
+        await update.message.reply_text(f"Error al listar tus alertas: {error}")
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+
+async def borrar_alerta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """¡VERSIÓN SQL! Borra una alerta de la BD."""
+    query = update.callback_query
+    await query.answer()
+    conn = None
+    try:
+        prefix, alert_id_str = query.data.split(":")
+        alert_id = int(alert_id_str)
+        chat_id = query.message.chat_id # Para seguridad
+        
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        
+        # Borramos solo si el chat_id coincide (para que no borres alertas de otros)
+        delete_query = "DELETE FROM alerts WHERE id = %s AND chat_id = %s RETURNING alias_general"
+        cursor.execute(delete_query, (alert_id, chat_id))
+        
+        # Obtenemos el resultado de RETURNING
+        deleted_alert = cursor.fetchone()
+        conn.commit()
+        
+        if deleted_alert:
+            alias = deleted_alert[0]
+            await query.edit_message_text(f"Alerta para *{alias}* borrada con éxito.", parse_mode="Markdown")
+        else:
+            await query.edit_message_text("Error: No se encontró la alerta o no te pertenece.")
+
+    except (Exception, psycopg2.Error) as error:
+        print(f"Error borrando alerta: {error}")
+        await query.edit_message_text("Error al borrar la alerta.")
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+
     
 
    
@@ -664,6 +724,12 @@ if __name__ == '__main__':
     # ... (Comprobaciones de TOKEN y CHAT_ID, y el hilo de Flask... todo eso igual)
     if not MI_TOKEN:
         print("!!! ERROR CRÍTICO: No se encontró la variable de entorno MI_TOKEN !!!")
+        exit()
+    if not MI_CHAT_ID:
+        print("!!! ERROR CRÍTICO: No se encontró la variable de entorno MI_CHAT_ID !!!")
+        exit()
+    if not DATABASE_URL:
+        print("!!! ERROR CRÍTICO: No se encontró la variable de entorno DATABASE_URL !!!")
         exit()
     # ... (etc)
     
@@ -706,6 +772,8 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler('opciones', opciones))
     application.add_handler(CommandHandler('tickers', tickers))
     application.add_handler(CommandHandler('misalertas', mis_alertas))
+    
+    application.add_handler(CommandHandler('initdb', init_db))
     
     # --- Registra los "OYENTES" ---
     # (¡Ojo! Estos botones fallarán si se pulsan DENTRO de la conversación)
